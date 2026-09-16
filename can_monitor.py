@@ -1,178 +1,261 @@
 import can
 import time
 
-from can_protocol import CAN_IDS, LIMITS
+from can_protocol import CAN_IDS
 
 
-# Map CAN ID -> signal name
-ID_TO_SIGNAL = {
-    value: key
-    for key, value in CAN_IDS.items()
-}
+# ============================================================
+# CAN MONITOR / INTRUSION DETECTION SYSTEM
+# ============================================================
 
+INTERFACE = "socketcan"
+CHANNEL = "vcan0"
 
-# Expected payload length for each CAN message
-EXPECTED_LENGTH = {
-    CAN_IDS["ENGINE_RPM"]: 3,       # RPM (2 bytes) + counter (1 byte)
-    CAN_IDS["VEHICLE_SPEED"]: 2,
-    CAN_IDS["BRAKE_STATUS"]: 1,
-    CAN_IDS["GPS_STATUS"]: 1,
-}
-
-
-# Maximum messages allowed per second for each CAN ID
+# Maximum expected messages per second for one CAN ID
 RATE_LIMIT = 10
 
+# Maximum legitimate RPM change between two consecutive
+# Engine ECU messages
+MAX_RPM_CHANGE = 500
 
-# Store message counts for rate monitoring
+
+# ============================================================
+# CAN MESSAGE DEFINITIONS
+# ============================================================
+
+EXPECTED_LENGTH = {
+    CAN_IDS["ENGINE_RPM"]: 3,       # 2 bytes RPM + 1 byte counter
+    CAN_IDS["VEHICLE_SPEED"]: 2,    # 2 bytes speed
+    CAN_IDS["BRAKE_STATUS"]: 1,     # 1 byte status
+    CAN_IDS["GPS_STATUS"]: 1,       # 1 byte status
+}
+
+
+ID_TO_SIGNAL = {
+    CAN_IDS["ENGINE_RPM"]: "ENGINE_RPM",
+    CAN_IDS["VEHICLE_SPEED"]: "VEHICLE_SPEED",
+    CAN_IDS["BRAKE_STATUS"]: "BRAKE_STATUS",
+    CAN_IDS["GPS_STATUS"]: "GPS_STATUS",
+}
+
+
+# ============================================================
+# MONITOR STATE
+# ============================================================
+
+# Number of messages received for each CAN ID
 message_counts = {}
 
-
-# Store the latest rolling counter for each CAN ID
+# Last rolling counter received for each CAN ID
 last_counters = {}
 
+# Last known RPM received from each Engine CAN ID
+last_rpm = {}
 
-# Start of rate measurement window
+# Start of the current rate-monitoring window
 window_start = time.time()
 
 
-def decode_value(message):
+# ============================================================
+# CAN PAYLOAD DECODER
+# ============================================================
+
+def decode_value(can_id, data):
     """
-    Decode the CAN payload according to our protocol.
+    Decode CAN payload according to the project protocol.
     """
 
-    signal = ID_TO_SIGNAL[message.arbitration_id]
+    # --------------------------------------------------------
+    # Engine RPM
+    # --------------------------------------------------------
 
-    if signal == "ENGINE_RPM":
+    if can_id == CAN_IDS["ENGINE_RPM"]:
 
-        # First two bytes = RPM
         rpm = int.from_bytes(
-            message.data[:2],
+            data[0:2],
             byteorder="big"
         )
 
-        # Third byte = rolling counter
-        counter = message.data[2]
+        counter = data[2]
 
         return rpm, counter
 
-    if signal == "VEHICLE_SPEED":
 
-        return int.from_bytes(
-            message.data,
+    # --------------------------------------------------------
+    # Vehicle Speed
+    # --------------------------------------------------------
+
+    elif can_id == CAN_IDS["VEHICLE_SPEED"]:
+
+        speed = int.from_bytes(
+            data[0:2],
             byteorder="big"
         )
 
-    if signal == "BRAKE_STATUS":
+        return speed
 
-        return message.data[0]
 
-    if signal == "GPS_STATUS":
+    # --------------------------------------------------------
+    # Brake Status
+    # --------------------------------------------------------
 
-        return message.data[0]
+    elif can_id == CAN_IDS["BRAKE_STATUS"]:
 
+        return data[0]
+
+
+    # --------------------------------------------------------
+    # GPS Status
+    # --------------------------------------------------------
+
+    elif can_id == CAN_IDS["GPS_STATUS"]:
+
+        return data[0]
+
+
+    return None
+
+
+# ============================================================
+# RATE MONITOR RESET
+# ============================================================
+
+def reset_rate_window():
+    """
+    Reset message counters after each monitoring window.
+    """
+
+    global message_counts
+    global window_start
+
+    message_counts = {}
+
+    window_start = time.time()
+
+
+# ============================================================
+# FRAME ANALYSIS
+# ============================================================
 
 def analyze_frame(message):
     """
-    Analyze one CAN frame and detect suspicious behavior.
+    Analyze one CAN frame for suspicious activity.
     """
-
-    global window_start
-    global message_counts
 
     can_id = message.arbitration_id
 
+    data = message.data
 
-    # =========================================================
-    # 1. MESSAGE RATE MONITORING
-    # =========================================================
+
+    # ========================================================
+    # 1. CAN RATE / FLOODING DETECTION
+    # ========================================================
 
     message_counts[can_id] = (
         message_counts.get(can_id, 0) + 1
     )
 
-    current_time = time.time()
+    elapsed = time.time() - window_start
 
-    if current_time - window_start >= 1:
+    if elapsed >= 1.0:
 
         for monitored_id, count in message_counts.items():
 
-            if count > RATE_LIMIT:
+            rate = count / elapsed
+
+            if rate > RATE_LIMIT:
 
                 print(
                     f"[ALERT] CAN flooding suspected | "
                     f"ID=0x{monitored_id:03X} | "
-                    f"Rate={count} msg/s"
+                    f"Rate={rate:.0f} msg/s"
                 )
 
-        # Reset counters
-        message_counts = {}
-
-        window_start = current_time
+        reset_rate_window()
 
 
-    # =========================================================
-    # 2. CHECK WHETHER CAN ID IS KNOWN
-    # =========================================================
+    # ========================================================
+    # 2. UNKNOWN CAN ID
+    # ========================================================
 
     if can_id not in ID_TO_SIGNAL:
 
         print(
-            f"[ALERT] Unknown CAN ID: "
-            f"0x{can_id:03X} | "
-            f"Data={message.data.hex(' ')}"
+            f"[ALERT] Unknown CAN ID | "
+            f"ID=0x{can_id:03X}"
         )
 
         return
 
 
-    signal = ID_TO_SIGNAL[can_id]
+    signal_name = ID_TO_SIGNAL[can_id]
 
 
-    # =========================================================
-    # 3. CHECK DATA LENGTH
-    # =========================================================
+    # ========================================================
+    # 3. DATA LENGTH VALIDATION
+    # ========================================================
 
     expected_length = EXPECTED_LENGTH[can_id]
 
-    if len(message.data) != expected_length:
+    if len(data) != expected_length:
 
         print(
-            f"[ALERT] Invalid length | "
+            f"[ALERT] Invalid data length | "
             f"ID=0x{can_id:03X} | "
-            f"Signal={signal} | "
             f"Expected={expected_length} | "
-            f"Received={len(message.data)}"
+            f"Received={len(data)}"
         )
 
         return
 
 
-    # =========================================================
+    # ========================================================
     # 4. DECODE MESSAGE
-    # =========================================================
+    # ========================================================
 
-    value = decode_value(message)
-
-
-    # =========================================================
-    # 5. ENGINE RPM
-    # =========================================================
-
-    if signal == "ENGINE_RPM":
-
-        rpm, counter = value
+    decoded = decode_value(
+        can_id,
+        data
+    )
 
 
-        # -----------------------------------------------------
-        # Replay / stale message detection
-        # -----------------------------------------------------
+    # ========================================================
+    # ENGINE RPM
+    # ========================================================
+
+    if can_id == CAN_IDS["ENGINE_RPM"]:
+
+        rpm, counter = decoded
+
+
+        # ----------------------------------------------------
+        # 4A. REPLAY / COUNTER VALIDATION
+        # ----------------------------------------------------
 
         if can_id in last_counters:
 
             last_counter = last_counters[can_id]
 
-            if counter <= last_counter:
+            # Difference calculated modulo 256.
+            #
+            # This correctly handles:
+            #
+            # 254 -> 255
+            # 255 -> 0
+            # 0   -> 1
+
+            counter_difference = (
+                counter - last_counter
+            ) % 256
+
+
+            # Same counter received again
+            #
+            # Example:
+            #
+            # 10 -> 10
+
+            if counter_difference == 0:
 
                 print(
                     f"[ALERT] Possible replay attack | "
@@ -184,22 +267,79 @@ def analyze_frame(message):
                 return
 
 
-        # Store newest counter
+            # Large backwards jump
+            #
+            # Example:
+            #
+            # 100 -> 50
+            #
+            # This can indicate an old/stale frame.
+
+            if counter_difference > 128:
+
+                print(
+                    f"[ALERT] Stale/out-of-order counter | "
+                    f"ID=0x{can_id:03X} | "
+                    f"Counter={counter} | "
+                    f"Last Counter={last_counter}"
+                )
+
+                return
+
+
+        # Save latest counter
+
         last_counters[can_id] = counter
 
 
-        # -----------------------------------------------------
-        # RPM validation
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # 4B. RPM RANGE VALIDATION
+        # ----------------------------------------------------
 
-        if rpm > LIMITS["ENGINE_RPM"]:
+        if rpm > 3000:
 
             print(
-                f"[ALERT] Abnormal RPM: {rpm}"
+                f"[ALERT] Invalid Engine RPM | "
+                f"RPM={rpm}"
             )
 
             return
 
+
+        # ----------------------------------------------------
+        # 4C. RPM BEHAVIOR / SPOOFING DETECTION
+        # ----------------------------------------------------
+
+        if can_id in last_rpm:
+
+            previous_rpm = last_rpm[can_id]
+
+            rpm_change = abs(
+                rpm - previous_rpm
+            )
+
+
+            if rpm_change > MAX_RPM_CHANGE:
+
+                print(
+                    f"[ALERT] Possible spoofing attack | "
+                    f"ID=0x{can_id:03X} | "
+                    f"Previous RPM={previous_rpm} | "
+                    f"Current RPM={rpm} | "
+                    f"Change={rpm_change}"
+                )
+
+                return
+
+
+        # Save current RPM
+
+        last_rpm[can_id] = rpm
+
+
+        # ----------------------------------------------------
+        # 4D. NORMAL ENGINE MESSAGE
+        # ----------------------------------------------------
 
         print(
             f"[OK] Engine RPM: {rpm} | "
@@ -207,19 +347,20 @@ def analyze_frame(message):
         )
 
 
-    # =========================================================
-    # 6. VEHICLE SPEED
-    # =========================================================
+    # ========================================================
+    # VEHICLE SPEED
+    # ========================================================
 
-    elif signal == "VEHICLE_SPEED":
+    elif can_id == CAN_IDS["VEHICLE_SPEED"]:
 
-        speed = value
+        speed = decoded
 
-        if speed > LIMITS["VEHICLE_SPEED"]:
+
+        if speed > 120:
 
             print(
-                f"[ALERT] Abnormal vehicle speed: "
-                f"{speed} km/h"
+                f"[ALERT] Invalid vehicle speed | "
+                f"Speed={speed} km/h"
             )
 
             return
@@ -231,128 +372,154 @@ def analyze_frame(message):
         )
 
 
-    # =========================================================
-    # 7. BRAKE STATUS
-    # =========================================================
+    # ========================================================
+    # BRAKE STATUS
+    # ========================================================
 
-    elif signal == "BRAKE_STATUS":
+    elif can_id == CAN_IDS["BRAKE_STATUS"]:
 
-        brake_status = value
+        brake_status = decoded
+
 
         if brake_status not in (0, 1):
 
             print(
-                f"[ALERT] Invalid brake status: "
-                f"{brake_status}"
+                f"[ALERT] Invalid brake status | "
+                f"Value={brake_status}"
             )
 
             return
 
 
-        status = (
-            "APPLIED"
-            if brake_status == 1
-            else "RELEASED"
-        )
+        if brake_status == 1:
+
+            print(
+                "[OK] Brake Status: APPLIED"
+            )
+
+        else:
+
+            print(
+                "[OK] Brake Status: RELEASED"
+            )
 
 
-        print(
-            f"[OK] Brake: {status}"
-        )
+    # ========================================================
+    # GPS STATUS
+    # ========================================================
 
+    elif can_id == CAN_IDS["GPS_STATUS"]:
 
-    # =========================================================
-    # 8. GPS STATUS
-    # =========================================================
+        gps_status = decoded
 
-    elif signal == "GPS_STATUS":
-
-        gps_status = value
 
         if gps_status not in (0, 1):
 
             print(
-                f"[ALERT] Invalid GPS status: "
-                f"{gps_status}"
+                f"[ALERT] Invalid GPS status | "
+                f"Value={gps_status}"
             )
 
             return
 
 
-        status = (
-            "AVAILABLE"
-            if gps_status == 1
-            else "UNAVAILABLE"
-        )
+        if gps_status == 1:
+
+            print(
+                "[OK] GPS Status: AVAILABLE"
+            )
+
+        else:
+
+            print(
+                "[OK] GPS Status: UNAVAILABLE"
+            )
 
 
-        print(
-            f"[OK] GPS: {status}"
-        )
-
+# ============================================================
+# MAIN MONITOR
+# ============================================================
 
 def main():
 
-    # =========================================================
-    # CONNECT TO VIRTUAL CAN BUS
-    # =========================================================
-
-    bus = can.Bus(
-        interface="socketcan",
-        channel="vcan0"
-    )
-
-
     print("=" * 60)
-    print(" CAN SECURITY MONITOR")
+    print(" AGRICULTURAL VEHICLE CAN SECURITY MONITOR")
     print("=" * 60)
 
-    print("Listening on vcan0...")
-
     print(
-        f"Rate limit: "
-        f"{RATE_LIMIT} messages/sec"
+        f"Interface : {INTERFACE}"
     )
 
     print(
-        "Replay detection: ENABLED"
-    )
-
-    print(
-        "Unknown CAN ID detection: ENABLED"
-    )
-
-    print(
-        "Value validation: ENABLED"
-    )
-
-    print(
-        "Press CTRL+C to stop."
+        f"Channel   : {CHANNEL}"
     )
 
     print()
 
+    print("Security checks:")
+    print("  [1] CAN flooding")
+    print("  [2] Unknown CAN IDs")
+    print("  [3] Invalid data length")
+    print("  [4] Replay attacks")
+    print("  [5] Stale/out-of-order frames")
+    print("  [6] Engine RPM validation")
+    print("  [7] RPM spoofing detection")
+    print("  [8] Vehicle speed validation")
+    print("  [9] Brake status validation")
+    print(" [10] GPS status validation")
 
-    # =========================================================
-    # MAIN MONITORING LOOP
-    # =========================================================
+    print()
+
+    print("Press CTRL+C to stop.")
+    print("=" * 60)
+    print()
+
+
+    # ========================================================
+    # OPEN CAN BUS
+    # ========================================================
+
+    try:
+
+        bus = can.Bus(
+            interface=INTERFACE,
+            channel=CHANNEL
+        )
+
+    except Exception as error:
+
+        print(
+            f"[ERROR] Could not open CAN interface: {error}"
+        )
+
+        return
+
+
+    # ========================================================
+    # RECEIVE CAN FRAMES
+    # ========================================================
 
     try:
 
         while True:
 
-            message = bus.recv()
+            message = bus.recv(
+                timeout=1.0
+            )
 
-            if message is not None:
 
-                analyze_frame(message)
+            if message is None:
+
+                continue
+
+
+            analyze_frame(message)
 
 
     except KeyboardInterrupt:
 
-        print(
-            "\nMonitor stopped."
-        )
+        print()
+        print("CAN monitor stopped.")
 
 
     finally:
@@ -360,9 +527,9 @@ def main():
         bus.shutdown()
 
 
-# =============================================================
+# ============================================================
 # PROGRAM ENTRY POINT
-# =============================================================
+# ============================================================
 
 if __name__ == "__main__":
 
