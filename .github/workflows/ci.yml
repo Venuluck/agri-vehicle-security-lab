@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --only-binary :all: python-can==4.6.1 pytest==9.1.1
+          pip install --only-binary :all: -r requirements.txt
 
       - name: Run security tests
         run: |
